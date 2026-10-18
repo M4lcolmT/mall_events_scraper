@@ -1,21 +1,30 @@
 """
-The Exchange TRX - event listing collector (v2)
------------------------------------------------
+The Exchange TRX - event listing collector (v3: clean master event list)
+-----------------------------------------------------------------------
 Usage:
   pip install requests beautifulsoup4 pandas
   python trx_events_scraper.py live       # snapshot today's events page (run weekly)
   python trx_events_scraper.py wayback    # download archived snapshots (resumable)
   python trx_events_scraper.py discover   # list archived URLs on the whole domain -> data/discovered_urls.csv
   python trx_events_scraper.py articles   # download archived /journal/ + /press-room/ pages -> data/articles.csv
-  python trx_events_scraper.py build      # parse data/raw/*_events.html -> data/trx_events.csv
+  python trx_events_scraper.py build      # parse data/raw/* -> data/trx_events.csv (master) + data/trx_events_rows.csv (audit)
 
-Every command is safe to re-run: files already on disk are skipped, and permanent
-failures (404/403/410...) are remembered in data/failures.csv so they aren't retried.
-Optional hand-curation: data/organizer_overrides.csv  (columns: pattern,organizer_type,organizer_name)
+What changed in v3 (build step only - the download commands are unchanged):
+  * campaigns from the journal "Redemption T&C" pages are now events (exact campaign period, RM amounts on the page,
+    card partners, sold-out flag) and are merged with the events/promotions listings
+  * promotions snapshots are parsed too (city-park page is evergreen park info, so it is skipped)
+  * evergreen blurbs ("Visit Malaysia's only Apple Store", "Dates", ...) are dropped
+  * near-duplicate names / date-less repeats are merged into one row per event
+  * every row gets active_from / active_to / duration_days / month, with dates_estimated + review_flags
+    saying which rows still need a human look
+Optional hand-curation:
+  data/organizer_overrides.csv  (columns: pattern,organizer_type,organizer_name)
+  data/date_overrides.csv       (columns: pattern,start_date,end_date)   e.g.  Lego Pop-up,2025-09-01,2025-10-31
 """
 from __future__ import annotations
-import sys, re, time, random, calendar, csv, datetime as dt
+import sys, re, time, random, calendar, csv, unicodedata, datetime as dt
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -41,6 +50,7 @@ MAX_COOLDOWNS = 3        # still failing after this many cooldowns => stop clean
 
 RAW = Path("data/raw"); RAW.mkdir(parents=True, exist_ok=True)
 OUT_CSV = Path("data/trx_events.csv")
+ROWS_CSV = Path("data/trx_events_rows.csv")
 FAIL_CSV = Path("data/failures.csv")
 
 # ================================================================= HTTP layer
@@ -224,8 +234,6 @@ def norm_url(u):
     return f"https://www.{host}{path}", path
 
 def discover():
-    # NOTE v1 bug: it passed matchType=prefix AND a trailing '*' (url=.../journal/*). The '*' became part of the
-    # literal prefix, so nothing matched. Here we query the whole domain once and filter locally instead.
     rows = cdx_query(url=DOMAIN, matchType="domain", fl="timestamp,original,mimetype,statuscode",
                      filter="statuscode:200", collapse="urlkey", limit=100000)
     if rows is None: sys.exit("CDX request failed - rerun later (see data/failures.csv)")
@@ -269,7 +277,7 @@ def articles():
         main = s.find(id="mainContent") or s.find("main") or s
         rows.append(dict(file=f.name, title=meta("og:title") or (s.title.string if s.title else None),
                          published=meta("article:published_time") or (t.get("datetime") or t.get_text(strip=True) if t else None),
-                         text=main.get_text(" ", strip=True)[:3000]))
+                         text=main.get_text(" ", strip=True)[:8000]))
     pd.DataFrame(rows).to_csv("data/articles.csv", index=False)
     print(f"{len(rows)} articles -> data/articles.csv")
 
@@ -360,7 +368,8 @@ MALL_TITLE_RE = re.compile(r"\bat the exchange trx\b|\bthe exchange trx\b", re.I
 KNOWN_TENANTS = ["Apple", "Today at Apple", "Aurum", "Aesop", "Beauty Galleria", "Beauty Affairs", "Coach", "diptyque",
                  "Estee Lauder", "Estée Lauder", "Hokkaido Table", "Kissa Diner", "Lancôme", "Lancome", "Lane 23",
                  "Louis Vuitton", "MPH", "Rituals", "SEIBU", "Seibu", "Tiffany & Co.", "Tiffany", "TROVE", "Watsons",
-                 "Guerlain", "La Prairie", "Acqua di Parma"]
+                 "Guerlain", "La Prairie", "Acqua di Parma", "Armani Exchange", "LEGO", "Lego", "Kate Spade",
+                 "Bottega Veneta", "Longchamp", "TAG Heuer", "Sanrio"]
 AMBIGUOUS_WORDS = {"coach", "trove", "rituals", "apple"}   # only match as title prefix, not anywhere in the text
 
 MALL_CUES = re.compile(r"\b(join us|we'?re|we are|we'?ve|we unveil|unveil|throughout the (?:mall|centre|center)|"
@@ -406,6 +415,8 @@ def classify_organizer(title, desc, link, venue):
 
     if MALL_PROGRAM_RE.search(head):
         return "mall", "The Exchange TRX", f"mall programme name '{head}'"
+    if prefix and _tenant_match(prefix, prefix_only=True):
+        return "tenant", re.sub(r"^today at ", "", _tenant_match(prefix, True), flags=re.I), "known tenant in title"
     if MALL_TITLE_RE.search(title):
         return "mall", "The Exchange TRX", "title says 'at The Exchange TRX'"
     t = _tenant_match(head, prefix_only=True) or (None if prefix and not suffix_is_location else _tenant_match(title, False))
@@ -430,7 +441,7 @@ TYPE_RULES = [
     ("festive/seasonal", r"\bchristmas|chinese new year|\bcny\b|\braya\b|hari raya|deepavali|merdeka|new year|\bnye\b|countdown|festive|ramadan|bazaar|mid-autumn|holiday"),
     ("workshop/community", r"\bworkshops?\b|\bclass(es)?\b|\bsessions?\b|masterclass|meet\s*&\s*greet|\byoga\b|\bwellness\b"),
     ("arts/music/performance", r"\bmusic\b|\bconcert\b|\bfestival\b|\bperformances?\b|\bdance\b|\bexhibit"),
-    ("retail promotion/campaign", r"\bredeem|spend rm|\bpromotions?\b|\bdeals?\b|\bvoucher|\bsale\b|cravings|\beats\b|gift with purchase|\brewards\b"),
+    ("retail promotion/campaign", r"\bredeem|spend rm|\bpromotions?\b|\bdeals?\b|\bvoucher|\bsale\b|cravings|\beats\b|gift with purchase|\brewards\b|\bspree\b|fiesta"),
 ]
 def classify(title, desc):
     for text in (title, desc):          # title is a much stronger signal than body text
@@ -460,7 +471,8 @@ def _make_row(title, lines, link, section, snap, src):
                 organizer_basis=basis, event_type=classify(title, desc), start_date=start and start.isoformat(),
                 end_date=end and end.isoformat(), date_precision=prec, date_text_raw=raw, time_text=tm.group(0) if tm else None,
                 venue_in_mall=venue, hosted_in_common_area=bool(venue), listing_section=section, is_dated=bool(start or end),
-                description=desc[:1000], link=link, snapshot_date=snap.isoformat(), source=src)
+                description=desc[:1000], link=link, snapshot_date=snap.isoformat(), source=src,
+                page="events", rm_amounts=None, card_partners=None, sold_out=None, has_spend_redemption=None)
 
 def parse_events_page(html, snap, src):
     soup = BeautifulSoup(html, "html.parser")
@@ -495,27 +507,234 @@ def parse_events_page(html, snap, src):
         rows.append(_make_row(title, body, a["href"] if a else None, h2.get_text(" ", strip=True) if h2 else None, snap, src))
     return rows
 
+# ================================================================= journal campaigns (redemption T&C pages)
+# These pages carry the exact campaign period, spend tiers, card partners and a [FULLY REDEEMED] flag.
+CAMPAIGN_TITLE = re.compile(r"redemption|contest|giveaway|carnival|spree|fiesta|\beats\b|tale of spring|countdown|"
+                            r"meet\s*&\s*greet|performance schedule|rewards", re.I)
+TC_TITLE = re.compile(r"terms|redemption|giveaway|contest|performance schedule", re.I)
+TC_SUFFIX = re.compile(r"\s*\|?\s*(?:Contest\s+)?(?:Redemptions?\s+)?Terms\s*(?:&|and)\s*Conditions\s*$", re.I)
+PERIOD_CTX = re.compile(r"(?:valid|runs?|campaign period|contest period|redemption period)[^.]{0,140}", re.I)
+MONEY = re.compile(r"RM\s?(\d[\d,]*)")
+CARDS = re.compile(r"\b(UOB|Maybank|CIMB|Public Bank|HSBC|Citi|Visa|Mastercard|Amex|American Express)\b")
+MALL_WIDE_RE = re.compile(r"employees of the tenants|at any store|any (?:participating )?store\*? at the exchange trx", re.I)
+_PREC_RANK = {"range": 3, "start_only": 2, "end_only": 2, "single": 1, None: 0}
+# T&C pages mostly write "January 4 to February 9, 2025" / "October 3 to 26, 2025" (month first)
+MD_RANGE = re.compile(r"\b([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?\s*(?:–|—|-|to|until|till)\s*"
+                      r"(?:([A-Za-z]{3,9})\.?\s+)?(\d{1,2})(?:,?\s*(\d{4}))?", re.I)
+
+def _parse_period(text, snap):
+    """Campaign-period parser: month-first ranges first, then the generic day-first parser. Singles are ignored."""
+    for m in MD_RANGE.finditer(text):
+        m1, d1, y1, m2, d2, y2 = m.groups()
+        mo1 = mon(m1); mo2 = mon(m2) if m2 else mo1
+        if not mo1 or not mo2: continue
+        end = _mkdate(d2, mo2, y2 or y1, snap)
+        if not end: continue
+        start = _mkdate(d1, mo1, y1 or y2 or str(end.year), snap)
+        if start and start > end and not y1: start = _mkdate(d1, mo1, str(end.year - 1), snap)
+        if start: return start, end, m.group(0), "range"
+    res = _parse_dates_text(text, snap)
+    return res if res[3] in ("range", "start_only", "end_only") else (None, None, None, None)
+
+def _published(s, fallback):
+    m = s.find("meta", attrs={"property": "article:published_time"}) or s.find("meta", attrs={"name": "article:published_time"})
+    raw = m.get("content") if m else None
+    if not raw:
+        t = s.find("time"); raw = (t.get("datetime") or t.get_text(strip=True)) if t else None
+    if raw:
+        try: return dt.date.fromisoformat(raw.strip()[:10])
+        except ValueError:
+            d = _parse_dates_text(raw, fallback)[0]
+            if d: return d
+    return fallback
+
+def campaign_fields(title, text, published):
+    """Pure function (easy to test): title + full page text -> campaign dict."""
+    title = title.translate(_HYPHENS); text = text.translate(_HYPHENS)
+    sold_out = "FULLY REDEEMED" in title.upper()
+    name = TC_SUFFIX.sub("", re.sub(r"\[FULLY REDEEMED\]\s*", "", title, flags=re.I)).strip(" |")
+    best = (None, None, None, None)
+    for m in PERIOD_CTX.finditer(text):
+        res = _parse_period(m.group(0), published)
+        if _PREC_RANK[res[3]] > _PREC_RANK[best[3]]: best = res
+        if best[3] == "range": break
+    if best[0] and best[1] and best[0] > best[1]: best = (None, best[1], best[2], "end_only")   # typo on the page
+    spends = sorted({int(x.replace(",", "")) for x in MONEY.findall(text)})
+    cards = sorted(set(CARDS.findall(text)))
+    return dict(name=name, start=best[0], end=best[1], prec=best[3], raw=best[2], sold_out=sold_out,
+                spends=spends, cards=cards, mall_wide=bool(MALL_WIDE_RE.search(text)))
+
+def parse_campaign(f):
+    s = BeautifulSoup(f.read_text(encoding="utf-8", errors="ignore"), "html.parser")
+    meta = s.find("meta", attrs={"property": "og:title"})
+    title = (meta.get("content") if meta else None) or (s.title.string if s.title else "") or ""
+    if not CAMPAIGN_TITLE.search(title): return None
+    main = s.find(id="mainContent") or s.find("main") or s
+    text = main.get_text(" ", strip=True)
+    fallback = dt.datetime.strptime(f.stem.split("_")[1][:8], "%Y%m%d").date()
+    pub = _published(s, fallback)
+    c = campaign_fields(title, text, pub)
+    if not TC_TITLE.search(title) and c["prec"] != "range": return None      # e.g. "Everything You Need to Know About ..."
+    return campaign_row(c, text, pub, f"journal:{f.name}")
+
+def campaign_row(c, text, pub, src):
+    body = re.sub(r"^.*?Full Terms & Conditions\s*", "", text, count=1, flags=re.S)[:600]
+    row = _make_row(c["name"], [body], None, "journal campaign", pub, src)
+    if c["start"] or c["end"]:
+        row.update(start_date=c["start"] and c["start"].isoformat(), end_date=c["end"] and c["end"].isoformat(),
+                   date_precision=c["prec"], date_text_raw=c["raw"], is_dated=True)
+    else:
+        row.update(start_date=None, end_date=None, date_precision=None, date_text_raw=None, is_dated=False)
+    if c["mall_wide"] and row["organizer_type"] in ("unknown", "tenant", "brand_popup") and row["organizer_basis"] != "manual override":
+        if not _tenant_match(c["name"].split("|")[0], True):
+            row.update(organizer_type="mall", organizer_name="The Exchange TRX", organizer_basis="journal T&C: mall-wide redemption")
+    if row["event_type"] == "other/unclassified" and c["spends"]:
+        row["event_type"] = "retail promotion/campaign"
+    row.update(page="journal", rm_amounts="; ".join(f"RM{x:,}" for x in c["spends"]) or None,
+               card_partners="; ".join(c["cards"]) or None, sold_out=c["sold_out"], has_spend_redemption=bool(c["spends"]))
+    return row
+
+# ================================================================= cleaning + merging
+EVERGREEN_TITLE = re.compile(r"^(attend a|catch a|visit|explore|pay a visit|enjoy a|dates$|find out|skip to)", re.I)
+_NAME_NOISE = re.compile(r"\b(exclusive|pop-?\s?up|activation|now screening|redemptions?|campaign|terms|conditions|"
+                         r"the exchange trx|at the exchange trx|disney|pixar)\b")
+
+def norm_name(t):
+    t = unicodedata.normalize("NFKD", (t or "").translate(_HYPHENS).lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = _NAME_NOISE.sub(" ", t)
+    return re.sub(r"[^a-z0-9]+", " ", t).strip()
+
+def same_name(a, b):
+    return a == b or SequenceMatcher(None, a, b).ratio() >= 0.85
+
+_d = lambda x: dt.date.fromisoformat(x) if isinstance(x, str) and x else None
+def _window(r):
+    s, e = _d(r["start_date"]), _d(r["end_date"])
+    return None if (s is None and e is None) else (s or e, e or s)
+def _overlap(a, b, pad=7):
+    p = dt.timedelta(days=pad)
+    return a[0] - p <= b[1] and b[0] - p <= a[1]
+
+def load_rows():
+    rows, dropped = [], []
+    for page, pat in (("events", "*_events.html"), ("promotions", "*_promotions.html")):
+        for p in sorted(RAW.glob(pat)):
+            src, snap = snapshot_meta(p)
+            for r in parse_events_page(p.read_text(encoding="utf-8", errors="ignore"), snap, f"{src}:{p.name}"):
+                r["page"] = page; rows.append(r)
+    for f in sorted(RAW.glob("art_*_journal-*.html")):
+        r = parse_campaign(f)
+        if r: rows.append(r)
+    keep = []
+    for r in rows:
+        if not r["is_dated"] and EVERGREEN_TITLE.search(r["event_name"].strip()): dropped.append(r["event_name"])
+        else: keep.append(r)
+    return keep, sorted(set(dropped))
+
+def cluster_rows(rows):
+    rows = sorted(rows, key=lambda r: (r["snapshot_date"], r["page"] != "journal", r["source"]))
+    clusters = []
+    for r in rows:
+        k, w, snap = norm_name(r["event_name"]), _window(r), _d(r["snapshot_date"])
+        home = None
+        for c in clusters:
+            if not same_name(k, c["key"]): continue
+            ok = _overlap(w, c["win"]) if (w and c["win"]) else (snap - c["last"]).days <= 120
+            if ok: home = c; break
+        if home is None:
+            home = dict(key=k, win=None, last=snap, rows=[]); clusters.append(home)
+        home["rows"].append(r); home["last"] = max(home["last"], snap)
+        if w: home["win"] = w if home["win"] is None else (min(home["win"][0], w[0]), max(home["win"][1], w[1]))
+    return clusters
+
+def _best_dates(rs):
+    rank = lambda r: (r["page"] == "journal", _PREC_RANK[r["date_precision"]], r["snapshot_date"])
+    dated = sorted([r for r in rs if r["is_dated"]], key=rank)
+    if not dated: return None, None, None, None
+    best = dated[-1]
+    s, e = _d(best["start_date"]), _d(best["end_date"])
+    for r in reversed(dated):                      # fill a missing side from another snapshot of the same event
+        if s is None and _d(r["start_date"]) and (e is None or _d(r["start_date"]) <= e): s = _d(r["start_date"])
+        if e is None and _d(r["end_date"]) and (s is None or _d(r["end_date"]) >= s): e = _d(r["end_date"])
+    return s, e, best["date_precision"], best["date_text_raw"]
+
+def merge_cluster(c):
+    rs = sorted(c["rows"], key=lambda r: r["snapshot_date"])
+    listing = [r for r in rs if r["page"] != "journal"] or rs
+    jr = [r for r in rs if r["page"] == "journal"]
+    last = listing[-1]
+    org = next((r for r in jr if r["organizer_basis"].startswith("journal")), None) or \
+          next((r for r in reversed(rs) if r["organizer_basis"] == "manual override"), None) or last
+    start, end, prec, raw = _best_dates(rs)
+    first_seen, last_seen = _d(rs[0]["snapshot_date"]), _d(rs[-1]["snapshot_date"])
+    ev = [r for r in rs if r["page"] != "journal"]
+    jr1 = jr[-1] if jr else {}
+    return dict(
+        event_name=last["event_name"], organizer_type=org["organizer_type"], organizer_name=org["organizer_name"],
+        event_type=(jr1.get("event_type") if jr1 and jr1["event_type"] != "other/unclassified" else last["event_type"]),
+        start_date=start, end_date=end, date_precision=prec, date_text_raw=raw,
+        time_text=next((r["time_text"] for r in reversed(rs) if r["time_text"]), None),
+        venue_in_mall=next((r["venue_in_mall"] for r in reversed(rs) if r["venue_in_mall"]), None),
+        hosted_in_common_area=any(r["hosted_in_common_area"] for r in rs),
+        has_spend_redemption=bool(jr1.get("has_spend_redemption")),
+        rm_amounts=next((r["rm_amounts"] for r in reversed(jr) if r["rm_amounts"]), None),
+        card_partners=next((r["card_partners"] for r in reversed(jr) if r["card_partners"]), None),
+        sold_out=any(r["sold_out"] for r in jr) if jr else None,
+        listing_section=last["listing_section"], description=last["description"],
+        link=next((r["link"] for r in reversed(ev) if r["link"]), None),
+        first_seen=first_seen, last_seen=last_seen, n_snapshots=len({r["snapshot_date"] for r in ev}),
+        sources=", ".join(sorted({("journal" if r["page"] == "journal" else f"{r['page']}_page") for r in rs})),
+        organizer_basis=org["organizer_basis"])
+
+def apply_date_overrides(df):
+    p = Path("data/date_overrides.csv")
+    if not p.exists(): return df
+    for o in pd.read_csv(p).fillna("").to_dict("records"):
+        m = df["event_name"].str.contains(o["pattern"], case=False, regex=False)
+        if o.get("start_date"): df.loc[m, "start_date"] = _d(o["start_date"])
+        if o.get("end_date"): df.loc[m, "end_date"] = _d(o["end_date"])
+        df.loc[m, "date_precision"] = "manual"
+    return df
+
+def finalize(df):
+    af, at, est, flags = [], [], [], []
+    for _, r in df.iterrows():
+        s, e = r["start_date"] if pd.notna(r["start_date"]) else None, r["end_date"] if pd.notna(r["end_date"]) else None
+        f = []
+        a = s or min(r["first_seen"], e) if (s or e) else r["first_seen"]
+        z = e or max(r["last_seen"], s or r["last_seen"])
+        if s is None: f.append("start_estimated" if e else "no_dates")
+        if e is None and s: f.append("end_estimated")
+        if s is None and e is None and r["n_snapshots"] >= 8: f.append("possible_evergreen")
+        if r["organizer_type"] == "unknown": f.append("organizer_unknown")
+        if r["date_precision"] == "manual": f = [x for x in f if "estimated" not in x]
+        af.append(a); at.append(max(a, z)); est.append(s is None or e is None); flags.append("; ".join(f) or None)
+    df["active_from"], df["active_to"], df["dates_estimated"], df["review_flags"] = af, at, est, flags
+    df["duration_days"] = [(b - a).days + 1 for a, b in zip(df["active_from"], df["active_to"])]
+    df["month"] = [a.strftime("%Y-%m") for a in df["active_from"]]
+    return df
+
+COLS = ["event_name", "organizer_type", "organizer_name", "event_type", "active_from", "active_to", "duration_days", "month",
+        "start_date", "end_date", "dates_estimated", "date_precision", "time_text", "venue_in_mall", "hosted_in_common_area",
+        "has_spend_redemption", "rm_amounts", "card_partners", "sold_out", "listing_section", "description", "link",
+        "first_seen", "last_seen", "n_snapshots", "sources", "review_flags", "organizer_basis", "date_text_raw"]
+
 def build():
-    rows = []
-    for p in sorted(RAW.glob("*_events.html")):
-        src, snap = snapshot_meta(p)
-        rows += parse_events_page(p.read_text(encoding="utf-8", errors="ignore"), snap, f"{src}:{p.name}")
+    rows, dropped = load_rows()
     if not rows: sys.exit("no event rows parsed - open a file in data/raw and adjust parse_events_page()")
-    df = pd.DataFrame(rows)
-    key = ["event_name", "start_date", "end_date"]
-    first = lambda c: (c, "first"); last = lambda c: (c, "last")
-    agg = df.sort_values("snapshot_date").groupby(key, dropna=False).agg(
-        mall=first("mall"), organizer_type=last("organizer_type"), organizer_name=last("organizer_name"),
-        organizer_basis=last("organizer_basis"), event_type=last("event_type"), date_precision=last("date_precision"),
-        date_text_raw=first("date_text_raw"), time_text=last("time_text"), venue_in_mall=last("venue_in_mall"),
-        hosted_in_common_area=last("hosted_in_common_area"), listing_section=last("listing_section"),
-        is_dated=first("is_dated"), description=last("description"), link=last("link"),
-        first_seen=("snapshot_date", "min"), last_seen=("snapshot_date", "max"),
-        n_snapshots=("snapshot_date", "count"), source=last("source"),
-    ).reset_index()
-    agg.to_csv(OUT_CSV, index=False)
-    print(f"{len(df)} raw rows -> {len(agg)} unique events -> {OUT_CSV}")
-    print(agg["organizer_type"].value_counts().to_string())
+    pd.DataFrame(rows).to_csv(ROWS_CSV, index=False)
+    merged = [merge_cluster(c) for c in cluster_rows(rows)]
+    df = finalize(apply_date_overrides(pd.DataFrame(merged)))
+    df = df.sort_values(["active_from", "event_name"])[COLS]
+    df.to_csv(OUT_CSV, index=False)
+    print(f"{len(rows)} raw rows -> {len(df)} unique events -> {OUT_CSV}   (audit trail: {ROWS_CSV})")
+    if dropped: print(f"dropped {len(dropped)} evergreen blurbs: {', '.join(dropped)}")
+    print(f"\nexact dates: {int((~df.dates_estimated).sum())}/{len(df)}   from journal campaigns: {int(df.sources.str.contains('journal').sum())}")
+    for col in ("organizer_type", "event_type"): print("\n" + df[col].value_counts().to_string())
+    print("\nevents active per start month:\n" + df["month"].value_counts().sort_index().to_string())
+    fl = df["review_flags"].dropna().str.split("; ").explode().value_counts()
+    if len(fl): print("\nneeds a look (review_flags):\n" + fl.to_string() + "\n-> fix via data/organizer_overrides.csv / data/date_overrides.csv")
 
 COMMANDS = {"live": scrape_live, "wayback": scrape_wayback, "discover": discover, "articles": articles, "build": build}
 
